@@ -21,7 +21,10 @@ export function initTypst() {
         getModule: () =>
           `${cdn}/@myriaddreamin/typst-ts-renderer@${version}/pkg/typst_ts_renderer_bg.wasm`,
       });
-      window.$typst.use(window.TypstSnippet.preloadFontFromUrl('/cjk.ttf'));
+      window.$typst.use(
+        window.TypstSnippet.fetchPackageRegistry(),
+        window.TypstSnippet.preloadFontFromUrl('/cjk.ttf'),
+      );
     });
   }
   return ready;

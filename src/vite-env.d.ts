@@ -8,6 +8,7 @@ interface Window {
     svg: (opts: { mainContent: string }) => Promise<string>;
   };
   TypstSnippet: {
+    fetchPackageRegistry: () => unknown;
     preloadFontFromUrl: (url: string) => unknown;
   };
 }
