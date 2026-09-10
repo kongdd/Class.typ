@@ -6,7 +6,7 @@
     "dev": "node server.mjs --dev",
     "start": "node server.mjs --dev",
     "build": "vite build",
-    "test": "node server.mjs --self-test"
+    "test": "node server.mjs --self-test && node tests/embed.test.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.84.2",

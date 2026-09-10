@@ -329,7 +329,7 @@ async function main() {
     sendJson(response, 404, { error: 'Not found' });
   });
 
-  const port = Number(process.env.TYPST_AGENT_PORT ?? 8765);
+  const port = Number(process.env.TYPST_AGENT_PORT ?? 8766);
   server.listen(port, '127.0.0.1', () => {
     console.log(`Typst 课堂: http://127.0.0.1:${port}`);
   });
