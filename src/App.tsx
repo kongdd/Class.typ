@@ -177,6 +177,61 @@ function DocPane({
   );
 }
 
+function Simulation({ onClose, role }: { onClose: () => void; role: Role }) {
+  const [mode, setMode] = useState<'edit' | 'run'>(role === 'teacher' ? 'edit' : 'run');
+  const [url, setUrl] = useState('');
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    setUrl('');
+    setError('');
+    fetch(mode === 'edit' ? '/api/pluto' : '/api/pluto-slider')
+      .then(async response => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error);
+        if (active) setUrl(data.url);
+      })
+      .catch(error => {
+        if (active) setError(String(error));
+      });
+    return () => {
+      active = false;
+    };
+  }, [mode]);
+
+  return (
+    <section className="simulation">
+      <header>
+        <strong>Julia 仿真</strong>
+        <span className="tabs">
+          <button className={mode === 'edit' ? 'on' : ''} onClick={() => setMode('edit')}>
+            创作
+          </button>
+          <button className={mode === 'run' ? 'on' : ''} onClick={() => setMode('run')}>
+            交互
+          </button>
+        </span>
+        <span className="simulation-actions">
+          {url ? (
+            <a href={url} target="_blank" rel="noreferrer">
+              新窗口
+            </a>
+          ) : null}
+          <button onClick={onClose}>返回课程</button>
+        </span>
+      </header>
+      {error ? (
+        <pre className="status">启动失败：{error}</pre>
+      ) : url ? (
+        <iframe title={mode === 'edit' ? 'Pluto.jl' : 'PlutoSliderServer'} src={url} allow="fullscreen" />
+      ) : (
+        <pre className="status">正在启动{mode === 'edit' ? ' Pluto' : '交互服务'}…</pre>
+      )}
+    </section>
+  );
+}
+
 export function App() {
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [activeId, setActiveId] = useState('');
@@ -192,6 +247,7 @@ export function App() {
   ]);
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
+  const [simulation, setSimulation] = useState(false);
   const skipSave = useRef(true);
   const appRef = useRef<HTMLDivElement>(null);
   const [side, setSide] = useState(200);
@@ -327,8 +383,12 @@ export function App() {
       <div className="app">
         <aside className="sidebar">
           <h1>Typst 课堂</h1>
+          <nav>
+            <button onClick={() => setSimulation(true)}>Julia 仿真</button>
+          </nav>
           <p className="status">在 content/ 下新建章节文件夹，放入 课件.typ 与 笔记.typ 后刷新。</p>
         </aside>
+        {simulation ? <Simulation role={role} onClose={() => setSimulation(false)} /> : null}
       </div>
     );
   }
@@ -351,6 +411,7 @@ export function App() {
           ))}
         </div>
         <nav>
+          <button onClick={() => setSimulation(true)}>Julia 仿真</button>
           {chapters.map(item => (
             <button
               key={item.id}
@@ -458,6 +519,7 @@ export function App() {
           {busy ? '…' : '发送'}
         </button>
       </aside>
+      {simulation ? <Simulation role={role} onClose={() => setSimulation(false)} /> : null}
     </div>
   );
 }

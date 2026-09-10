@@ -33,3 +33,5 @@ npm start
 ```
 
 打开 <http://127.0.0.1:8766>（占用时设 `TYPST_AGENT_PORT`）。教师编辑会写回上述 `.typ`；学生只读跟随。Chat 中 `/julia`、`/r` 跑本机代码。
+
+- <https://github.com/mitmath/computational-thinking>

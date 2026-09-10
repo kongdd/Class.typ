@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { existsSync, watch } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
+import { connect } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
@@ -18,6 +20,24 @@ import {
 const root = dirname(fileURLToPath(import.meta.url));
 const contentRoot = join(root, 'content');
 const docFiles = { tutorial: '课件.typ', notes: '笔记.typ' };
+const juliaProject = join(root, 'julia');
+const juliaServices = {
+  pluto: {
+    name: 'Pluto',
+    port: Number(process.env.PLUTO_PORT ?? 8767),
+    path: '/pluto/',
+    upstreamPath: '/pluto/',
+  },
+  slider: {
+    name: 'PlutoSliderServer',
+    port: Number(process.env.PLUTO_SLIDER_PORT ?? 8768),
+    path: '/slider/',
+    upstreamPath: '/',
+  },
+};
+for (const service of Object.values(juliaServices)) {
+  service.target = `http://127.0.0.1:${service.port}${service.upstreamPath}`;
+}
 const cjkFontPath = [
   '/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf',
   '/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc',
@@ -191,6 +211,105 @@ function runCode(lang, code) {
   });
 }
 
+async function waitForJuliaService(service, child) {
+  let spawnError;
+  child.once('error', error => {
+    spawnError = error;
+  });
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    if (spawnError) throw spawnError;
+    if (child.exitCode !== null) throw new Error(`${service.name} 已退出：${child.exitCode}`);
+    try {
+      const secret = service.secret ? `?secret=${service.secret}` : '';
+      const response = await fetch(service.target + secret, { signal: AbortSignal.timeout(1000) });
+      await response.body?.cancel();
+      if (response.ok) return service.path + secret;
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  throw new Error(`${service.name} 启动超时`);
+}
+
+function startJuliaService(service) {
+  if (service.ready) return service.ready;
+  const notebooks = JSON.stringify(join(juliaProject, 'notebooks'));
+  service.secret = service === juliaServices.pluto ? randomBytes(16).toString('hex') : '';
+  const code =
+    service === juliaServices.pluto
+      ? `using Pluto; options = Pluto.Configuration.from_flat_kwargs(; host="127.0.0.1", port=${service.port}, base_url="${service.path}", launch_browser=false); Pluto.run(Pluto.ServerSession(; options, secret="${service.secret}"))`
+      : `using PlutoSliderServer; PlutoSliderServer.run_directory(${notebooks}; SliderServer_port=${service.port}, SliderServer_host="127.0.0.1", SliderServer_watch_dir=true, Export_baked_notebookfile=false)`;
+  const child = spawn(
+    process.env.JULIA || 'julia',
+    [`--project=${juliaProject}`, '--startup-file=no', '-e', code],
+    { cwd: root, stdio: ['ignore', 'inherit', 'inherit'] },
+  );
+  service.process = child;
+  child.once('exit', () => {
+    if (service.process !== child) return;
+    service.process = undefined;
+    service.ready = undefined;
+    service.secret = undefined;
+  });
+  service.ready = waitForJuliaService(service, child).catch(error => {
+    child.kill();
+    throw error;
+  });
+  return service.ready;
+}
+
+function proxyPath(requestUrl, service) {
+  return service.upstreamPath + requestUrl.slice(service.path.length);
+}
+
+function proxyHttp(request, response, service) {
+  const upstream = httpRequest(
+    {
+      hostname: '127.0.0.1',
+      port: service.port,
+      path: proxyPath(request.url ?? service.path, service),
+      method: request.method,
+      headers: { ...request.headers, host: `127.0.0.1:${service.port}` },
+    },
+    source => {
+      response.writeHead(source.statusCode ?? 502, source.headers);
+      source.pipe(response);
+    },
+  );
+  upstream.on('error', error => {
+    if (response.headersSent) response.destroy(error);
+    else sendJson(response, 502, { error: String(error.message ?? error) });
+  });
+  request.pipe(upstream);
+}
+
+function proxyUpgrade(request, socket, head, service) {
+  const upstream = connect(service.port, '127.0.0.1', () => {
+    const headers = [];
+    for (let index = 0; index < request.rawHeaders.length; index += 2) {
+      const name = request.rawHeaders[index];
+      const lower = name.toLowerCase();
+      const value =
+        lower === 'host'
+          ? `127.0.0.1:${service.port}`
+          : lower === 'origin'
+            ? `http://127.0.0.1:${service.port}`
+            : request.rawHeaders[index + 1];
+      headers.push(`${name}: ${value}`);
+    }
+    upstream.write(
+      `${request.method} ${proxyPath(request.url ?? service.path, service)} HTTP/${request.httpVersion}\r\n${headers.join('\r\n')}\r\n\r\n`,
+    );
+    if (head.length) upstream.write(head);
+    upstream.pipe(socket).pipe(upstream);
+  });
+  upstream.on('error', () => socket.destroy());
+  socket.on('error', () => upstream.destroy());
+}
+
+process.once('exit', () => {
+  for (const service of Object.values(juliaServices)) service.process?.kill();
+});
+
 async function main() {
   await mkdir(contentRoot, { recursive: true });
   const liveClients = new Set();
@@ -228,10 +347,30 @@ async function main() {
 
   const server = createServer(async (request, response) => {
     const url = (request.url ?? '/').split('?')[0];
+    const juliaService = Object.values(juliaServices).find(service => url.startsWith(service.path));
 
+    if (juliaService) {
+      try {
+        await startJuliaService(juliaService);
+        return proxyHttp(request, response, juliaService);
+      } catch (error) {
+        return sendJson(response, 502, { error: String(error.message ?? error) });
+      }
+    }
     if (request.method === 'GET' && url === '/cjk.ttf' && cjk) {
       response.writeHead(200, { 'Content-Type': 'font/ttf' });
       return response.end(cjk);
+    }
+    if (
+      request.method === 'GET' &&
+      (url === '/api/pluto' || url === '/api/pluto-slider')
+    ) {
+      try {
+        const service = url === '/api/pluto' ? juliaServices.pluto : juliaServices.slider;
+        return sendJson(response, 200, { url: await startJuliaService(service) });
+      } catch (error) {
+        return sendJson(response, 500, { error: String(error.message ?? error) });
+      }
     }
     if (request.method === 'GET' && url === '/api/models') {
       if (!agent) return sendJson(response, 500, { error: 'Pi 未配置可用模型' });
@@ -327,6 +466,16 @@ async function main() {
 
     if (vite) return vite.middlewares(request, response);
     sendJson(response, 404, { error: 'Not found' });
+  });
+
+  server.on('upgrade', (request, socket, head) => {
+    const service = Object.values(juliaServices).find(item =>
+      (request.url ?? '').startsWith(item.path),
+    );
+    if (!service) return socket.destroy();
+    startJuliaService(service)
+      .then(() => proxyUpgrade(request, socket, head, service))
+      .catch(() => socket.destroy());
   });
 
   const port = Number(process.env.TYPST_AGENT_PORT ?? 8766);
