@@ -1,19 +1,15 @@
 import {
   useEffect,
-  useMemo,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
+import { Chat } from './Chat';
 import { embedVideos } from './embed';
 import { renderSvg } from './typst';
-
-type Pane = 'tutorial' | 'notes';
+import { useDocuments, type Pane } from './useDocuments';
 type Mode = 'preview' | 'edit';
 type Role = 'teacher' | 'student';
-type Model = { provider: string; id: string; name: string; thinkingLevels: string[] };
-type Chapter = { id: string; title: string; tutorial: string; notes: string };
-type Live = { activeId: string; chapters: Chapter[] };
 
 function lineAt(source: string, offset: number) {
   return source.slice(0, offset).split('\n').length;
@@ -60,13 +56,13 @@ function highlight(src: string) {
   return out + esc(src.slice(i));
 }
 
-function Preview({ source }: { source: string }) {
+function Preview({ source, dir }: { source: string; dir: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState('正在编译…');
   useEffect(() => {
     let gone = false;
     const timer = setTimeout(() => {
-      renderSvg(source)
+      renderSvg(source, dir)
         .then(svg => {
           if (gone || !ref.current) return;
           setStatus('');
@@ -81,7 +77,7 @@ function Preview({ source }: { source: string }) {
       gone = true;
       clearTimeout(timer);
     };
-  }, [source]);
+  }, [source, dir]);
   return (
     <div className="preview">
       {status ? <pre className="status">{status}</pre> : null}
@@ -136,6 +132,7 @@ function DocPane({
   title,
   pane,
   source,
+  dir,
   mode,
   focused,
   readOnly,
@@ -146,6 +143,7 @@ function DocPane({
   title: string;
   pane: Pane;
   source: string;
+  dir: string;
   mode: Mode;
   focused: boolean;
   readOnly: boolean;
@@ -165,7 +163,7 @@ function DocPane({
           ))}
         </span>
       </header>
-      {mode === 'preview' ? <Preview source={source} /> : (
+      {mode === 'preview' ? <Preview source={source} dir={dir} /> : (
         <Editor
           value={source}
           readOnly={readOnly}
@@ -233,149 +231,44 @@ function Simulation({ onClose, role }: { onClose: () => void; role: Role }) {
 }
 
 export function App() {
-  const [chapters, setChapters] = useState<Chapter[]>([]);
-  const [activeId, setActiveId] = useState('');
   const [modes, setModes] = useState<Record<Pane, Mode>>({ tutorial: 'preview', notes: 'edit' });
   const [focus, setFocus] = useState({ pane: 'tutorial' as Pane, line: 1, selection: '' });
   const [role, setRole] = useState<Role>('teacher');
-  const [models, setModels] = useState<Model[]>([]);
-  const [provider, setProvider] = useState('');
-  const [model, setModel] = useState('');
-  const [thinking, setThinking] = useState('off');
-  const [messages, setMessages] = useState<{ role: string; text: string }[]>([
-    { role: 'assistant', text: '单击课件或笔记，选中文本后发送。/julia 或 /r 可跑选区代码。' },
-  ]);
-  const [draft, setDraft] = useState('');
-  const [busy, setBusy] = useState(false);
+  const { chapters, activeId, setActiveId, edit, unsaved, discard, retry, connectionError } = useDocuments(role);
   const [simulation, setSimulation] = useState(false);
-  const skipSave = useRef(true);
   const appRef = useRef<HTMLDivElement>(null);
   const [side, setSide] = useState(200);
   const [mid, setMid] = useState([1, 1]);
-  const [chatW, setChatW] = useState(340);
+  const [chatW, setChatW] = useState(380);
 
   const chapter = chapters.find(item => item.id === activeId) ?? chapters[0];
-  const providers = useMemo(() => [...new Set(models.map(item => item.provider))], [models]);
-  const modelChoices = models.filter(item => item.provider === provider);
-  const thinkingChoices =
-    modelChoices.find(item => item.id === model)?.thinkingLevels ?? ['off'];
 
   useEffect(() => {
-    fetch('/api/models')
-      .then(async response => {
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error);
-        setModels(data.models);
-        setProvider(data.defaultModel.provider);
-        setModel(data.defaultModel.id);
-        setThinking(data.defaultThinkingLevel);
-      })
-      .catch(error => setMessages(cur => [...cur, { role: 'assistant', text: String(error) }]));
-    fetch('/api/chapters')
-      .then(async response => {
-        const data = (await response.json()) as Live;
-        skipSave.current = true;
-        setChapters(data.chapters);
-        setActiveId(data.activeId || data.chapters[0]?.id || '');
-      })
-      .catch(error => setMessages(cur => [...cur, { role: 'assistant', text: String(error) }]));
-  }, []);
+    setFocus(cur => ({ ...cur, line: 1, selection: '' }));
+  }, [chapter?.id]);
 
-  useEffect(() => {
-    if (role !== 'teacher' || !chapter) return;
-    if (skipSave.current) {
-      skipSave.current = false;
-      return;
-    }
-    const timer = setTimeout(() => {
-      fetch('/api/file', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: chapter.id,
-          tutorial: chapter.tutorial,
-          notes: chapter.notes,
-        }),
-      }).catch(() => {});
-    }, 400);
-    return () => clearTimeout(timer);
-  }, [role, chapter?.id, chapter?.tutorial, chapter?.notes]);
+  const setDoc = (pane: Pane, source: string) => edit(chapter.id, pane, source);
 
-  useEffect(() => {
-    if (role !== 'teacher' || !activeId) return;
-    fetch('/api/live', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ activeId }),
-    }).catch(() => {});
-  }, [role, activeId]);
+  const syncStatus = (
+    <div className="sync-status" aria-live="polite">
+      {connectionError && <p role="alert">{connectionError}</p>}
+      {unsaved.map(draft => (
+        <div key={`${draft.id}/${draft.pane}`}>
+          <strong>{draft.id} · {draft.pane === 'tutorial' ? '课件' : '笔记'}</strong>
+          <p>{draft.error || (draft.status === 'saving' ? '正在保存…' : '有未保存修改')}</p>
+          {draft.status === 'error' && <>
+            <a href={`data:text/plain;charset=utf-8,${encodeURIComponent(draft.source)}`}
+              download={`${draft.id}-${draft.pane}.typ`}>下载网页草稿</a>
+            <button disabled={role !== 'teacher'} onClick={() => retry(draft)}>重试保存</button>
+            <button onClick={() => discard(draft)}>放弃网页修改</button>
+          </>}
+        </div>
+      ))}
+    </div>
+  );
 
-  useEffect(() => {
-    if (role !== 'student') return;
-    const source = new EventSource('/api/live');
-    source.onmessage = event => {
-      const live = JSON.parse(event.data) as Live;
-      setChapters(live.chapters);
-      setActiveId(live.activeId);
-    };
-    return () => source.close();
-  }, [role]);
-
-  const setDoc = (pane: Pane, source: string) => {
-    if (role === 'student') return;
-    setChapters(cur =>
-      cur.map(item => (item.id === chapter.id ? { ...item, [pane]: source } : item)),
-    );
-  };
-
-  const send = async () => {
-    const text = draft.trim();
-    if (!text || busy) return;
-    setDraft('');
-    setMessages(cur => [...cur, { role: 'user', text }]);
-    setBusy(true);
-    const source = chapter[focus.pane];
-    const ctx = `${focus.pane === 'tutorial' ? '课件' : '笔记'} L${focus.line}`;
-    try {
-      if (text.startsWith('/julia') || text.startsWith('/r')) {
-        const lang = text.startsWith('/julia') ? 'julia' : 'r';
-        const code = focus.selection || text.replace(/^\/julia\s*|^\/r\s*/, '');
-        const response = await fetch('/api/run', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ lang, code }),
-        });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error);
-        setMessages(cur => [
-          ...cur,
-          { role: 'assistant', text: result.stdout || result.stderr || '(无输出)' },
-        ]);
-        return;
-      }
-      const instruction = focus.selection
-        ? `${text}\n\n[${ctx} 选区]\n${focus.selection}`
-        : `${text}\n\n[${ctx}]`;
-      const response = await fetch('/api/agent', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          source,
-          instruction,
-          provider,
-          model,
-          thinkingLevel: thinking,
-        }),
-      });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error);
-      setDoc(focus.pane, result.source);
-      setMessages(cur => [...cur, { role: 'assistant', text: `已修改${ctx}。` }]);
-    } catch (error) {
-      setMessages(cur => [...cur, { role: 'assistant', text: `失败：${error}` }]);
-    } finally {
-      setBusy(false);
-    }
+  const focusDoc = (pane: Pane, loc?: { line: number; selection: string }) => {
+    setFocus(cur => ({ pane, line: loc?.line ?? (cur.pane === pane ? cur.line : 1), selection: loc?.selection ?? '' }));
   };
 
   if (!chapter) {
@@ -386,7 +279,8 @@ export function App() {
           <nav>
             <button onClick={() => setSimulation(true)}>Julia 仿真</button>
           </nav>
-          <p className="status">在 content/ 下新建章节文件夹，放入 课件.typ 与 笔记.typ 后刷新。</p>
+          {syncStatus}
+          <p className="status">在 content/ 下新建章节文件夹，放入 课件.typ 与 笔记.typ。</p>
         </aside>
         {simulation ? <Simulation role={role} onClose={() => setSimulation(false)} /> : null}
       </div>
@@ -422,6 +316,7 @@ export function App() {
             </button>
           ))}
         </nav>
+        {syncStatus}
       </aside>
       <div
         className="split"
@@ -434,12 +329,13 @@ export function App() {
         title="课件"
         pane="tutorial"
         source={chapter.tutorial}
+        dir={chapter.id}
         mode={modes.tutorial}
         focused={focus.pane === 'tutorial'}
         readOnly={role === 'student'}
         onMode={mode => setModes(cur => ({ ...cur, tutorial: mode }))}
         onChange={source => setDoc('tutorial', source)}
-        onFocus={(pane, loc) => setFocus(cur => ({ pane, line: loc?.line ?? cur.line, selection: loc?.selection ?? '' }))}
+        onFocus={focusDoc}
       />
       <div
         className="split"
@@ -455,70 +351,34 @@ export function App() {
         title="笔记"
         pane="notes"
         source={chapter.notes}
+        dir={chapter.id}
         mode={modes.notes}
         focused={focus.pane === 'notes'}
         readOnly={role === 'student'}
         onMode={mode => setModes(cur => ({ ...cur, notes: mode }))}
         onChange={source => setDoc('notes', source)}
-        onFocus={(pane, loc) => setFocus(cur => ({ pane, line: loc?.line ?? cur.line, selection: loc?.selection ?? '' }))}
+        onFocus={focusDoc}
       />
       <div
         className="split"
         onPointerDown={e => {
           const c0 = chatW;
-          drag(e, dx => setChatW(Math.max(240, c0 - dx)));
+          drag(e, dx => setChatW(Math.min(640, Math.max(300, c0 - dx))));
         }}
       />
-      <aside className="chat">
-        <header>
-          <strong>Pi Chat</strong>
-          <span className="ctx">
-            {focus.pane === 'tutorial' ? '课件' : '笔记'} L{focus.line}
-            {focus.selection ? ` · ${focus.selection.length} 字` : ''}
-          </span>
-        </header>
-        <div className="pickers">
-          <select value={provider} onChange={event => setProvider(event.target.value)}>
-            {providers.map(item => (
-              <option key={item}>{item}</option>
-            ))}
-          </select>
-          <select value={model} onChange={event => setModel(event.target.value)}>
-            {modelChoices.map(item => (
-              <option key={item.id} value={item.id}>
-                {item.name}
-              </option>
-            ))}
-          </select>
-          <select value={thinking} onChange={event => setThinking(event.target.value)}>
-            {thinkingChoices.map(item => (
-              <option key={item}>{item}</option>
-            ))}
-          </select>
-        </div>
-        <div className="messages">
-          {messages.map((item, index) => (
-            <div key={index} className={`msg ${item.role}`}>
-              {item.text}
-            </div>
-          ))}
-        </div>
-        <textarea
-          value={draft}
-          rows={3}
-          placeholder="发送修改，或 /julia /r"
-          onChange={event => setDraft(event.target.value)}
-          onKeyDown={event => {
-            if (event.key === 'Enter' && !event.shiftKey) {
-              event.preventDefault();
-              send();
-            }
-          }}
-        />
-        <button disabled={busy} onClick={send}>
-          {busy ? '…' : '发送'}
-        </button>
-      </aside>
+      <Chat
+        context={{ id: chapter.id, title: chapter.title, source: chapter[focus.pane], ...focus }}
+        readOnly={role === 'student'}
+        onClearSelection={() => setFocus(cur => ({ ...cur, selection: '' }))}
+        onApply={(target, source) => {
+          if (role !== 'teacher') return '学生模式不能修改文档。';
+          if (chapter.id !== target.id) return '请切回原章节后应用修改。';
+          if (chapter[target.pane] !== target.source) return '文档已发生变化，请基于最新内容重新发送，避免覆盖。';
+          setDoc(target.pane, source);
+          setFocus(cur => ({ ...cur, selection: '' }));
+          return undefined;
+        }}
+      />
       {simulation ? <Simulation role={role} onClose={() => setSimulation(false)} /> : null}
     </div>
   );

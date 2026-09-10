@@ -2,12 +2,14 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync, watch } from 'node:fs';
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { createServer, request as httpRequest } from 'node:http';
 import { connect } from 'node:net';
-import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
+import { loadChapters, saveDocument } from './documents.mjs';
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -19,7 +21,28 @@ import {
 
 const root = dirname(fileURLToPath(import.meta.url));
 const contentRoot = join(root, 'content');
-const docFiles = { tutorial: '课件.typ', notes: '笔记.typ' };
+const packageRoot = join(
+  process.env.XDG_DATA_HOME || join(homedir(), '.local/share'),
+  'typst/packages',
+);
+const mime = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.typ': 'text/plain; charset=utf-8',
+  '.bib': 'text/plain; charset=utf-8',
+};
+
+async function listRel(dir, prefix = '') {
+  const out = [];
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith('.')) continue;
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) out.push(...(await listRel(join(dir, entry.name), rel)));
+    else out.push(rel);
+  }
+  return out;
+}
 const juliaProject = join(root, 'julia');
 const juliaServices = {
   pluto: {
@@ -45,39 +68,6 @@ const cjkFontPath = [
 
 export function extractTypst(text) {
   return (text.match(/```(?:typst)?\s*\n([\s\S]*?)```/i)?.[1] ?? text).trim();
-}
-
-function assertId(id) {
-  if (typeof id !== 'string' || !id || /[\\/]|\.\./.test(id)) throw new Error('非法章节');
-  return id;
-}
-
-async function loadChapters() {
-  const dirs = (await readdir(contentRoot, { withFileTypes: true }))
-    .filter(entry => entry.isDirectory())
-    .map(entry => entry.name)
-    .sort();
-  return Promise.all(
-    dirs.map(async id => {
-      const dir = join(contentRoot, id);
-      const read = name => readFile(join(dir, name), 'utf8').catch(() => '');
-      return {
-        id,
-        title: id,
-        tutorial: await read(docFiles.tutorial),
-        notes: await read(docFiles.notes),
-      };
-    }),
-  );
-}
-
-async function saveChapter(id, tutorial, notes) {
-  const dir = join(contentRoot, assertId(id));
-  await mkdir(dir, { recursive: true });
-  await Promise.all([
-    writeFile(join(dir, docFiles.tutorial), tutorial, 'utf8'),
-    writeFile(join(dir, docFiles.notes), notes, 'utf8'),
-  ]);
 }
 
 async function createAgentService() {
@@ -313,21 +303,34 @@ process.once('exit', () => {
 async function main() {
   await mkdir(contentRoot, { recursive: true });
   const liveClients = new Set();
-  let liveState = { activeId: '', chapters: await loadChapters() };
+  let liveState = { activeId: '', chapters: await loadChapters(contentRoot) };
   liveState.activeId = liveState.chapters[0]?.id ?? '';
   const broadcast = () => {
     const payload = `data: ${JSON.stringify(liveState)}\n\n`;
     for (const client of liveClients) client.write(payload);
   };
-  const refresh = async () => {
-    liveState = { ...liveState, chapters: await loadChapters() };
-    broadcast();
-  };
+  let refreshing;
+  const refresh = () => refreshing ??= loadChapters(contentRoot).then(chapters => {
+    const activeId = chapters.some(item => item.id === liveState.activeId)
+      ? liveState.activeId : chapters[0]?.id ?? '';
+    const next = { activeId, chapters };
+    if (JSON.stringify(next) !== JSON.stringify(liveState)) {
+      liveState = next;
+      broadcast();
+    }
+  }).finally(() => { refreshing = undefined; });
   let watchTimer;
-  watch(contentRoot, { recursive: true }, () => {
-    clearTimeout(watchTimer);
-    watchTimer = setTimeout(() => refresh().catch(console.warn), 150);
-  });
+  try {
+    watch(contentRoot, { recursive: true }, () => {
+      clearTimeout(watchTimer);
+      watchTimer = setTimeout(() => refresh().catch(console.warn), 150);
+    }).on('error', console.warn);
+  } catch (error) { console.warn(error); }
+  // Mounted filesystems may miss fs.watch events (e.g. edits from Windows on /mnt/z).
+  setInterval(() => refresh().catch(console.warn), 1000).unref();
+  setInterval(() => {
+    for (const client of liveClients) client.write(': keepalive\n\n');
+  }, 15_000).unref();
   const [cjk, agent, vite] = await Promise.all([
     cjkFontPath ? readFile(cjkFontPath) : null,
     createAgentService().catch(error => {
@@ -357,6 +360,30 @@ async function main() {
         return sendJson(response, 502, { error: String(error.message ?? error) });
       }
     }
+    if (request.method === 'GET' && url.startsWith('/packages/')) {
+      const match = /^\/packages\/([A-Za-z0-9-]+)\/([A-Za-z0-9-]+)-([0-9]+(?:\.[0-9]+)*)\.tar\.gz$/.exec(
+        decodeURIComponent(url),
+      );
+      const dir = match && join(packageRoot, match[1], match[2], match[3]);
+      if (!dir || !dir.startsWith(packageRoot) || !existsSync(join(dir, 'typst.toml'))) {
+        return sendJson(response, 404, { error: 'Not found' });
+      }
+      const files = await listRel(dir);
+      response.writeHead(200, { 'Content-Type': 'application/gzip' });
+      const tar = spawn('tar', ['-C', dir, '-czf', '-', ...files]);
+      tar.stdout.pipe(response);
+      tar.on('error', error => {
+        if (!response.headersSent) sendJson(response, 500, { error: String(error.message ?? error) });
+        else response.destroy(error);
+      });
+      return;
+    }
+    if (request.method === 'GET' && url.startsWith('/files/')) {
+      const file = join(contentRoot, decodeURIComponent(url.slice(7)));
+      if (!file.startsWith(contentRoot) || !existsSync(file)) return sendJson(response, 404, { error: 'Not found' });
+      response.writeHead(200, { 'Content-Type': mime[extname(file)] ?? 'application/octet-stream' });
+      return response.end(await readFile(file));
+    }
     if (request.method === 'GET' && url === '/cjk.ttf' && cjk) {
       response.writeHead(200, { 'Content-Type': 'font/ttf' });
       return response.end(cjk);
@@ -381,19 +408,21 @@ async function main() {
       });
     }
     if (request.method === 'GET' && url === '/api/chapters') {
-      return sendJson(response, 200, liveState);
+      try {
+        await refresh();
+        return sendJson(response, 200, liveState);
+      } catch (error) {
+        return sendJson(response, 500, { error: String(error.message ?? error) });
+      }
     }
     if (request.method === 'PUT' && url === '/api/file') {
       try {
         const body = await readJson(request, 500_000);
-        if (typeof body.tutorial !== 'string' || typeof body.notes !== 'string') {
-          return sendJson(response, 400, { error: '请求参数无效' });
-        }
-        await saveChapter(body.id, body.tutorial, body.notes);
-        await refresh();
+        saveDocument(contentRoot, body);
+        await refresh().catch(console.warn);
         return sendJson(response, 200, { ok: true });
       } catch (error) {
-        return sendJson(response, 400, { error: String(error.message ?? error) });
+        return sendJson(response, error.status ?? 500, { error: String(error.message ?? error) });
       }
     }
     if (request.method === 'GET' && url === '/api/live') {
@@ -401,10 +430,11 @@ async function main() {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
       });
       liveClients.add(response);
       response.write(`data: ${JSON.stringify(liveState)}\n\n`);
-      request.on('close', () => liveClients.delete(response));
+      response.on('close', () => liveClients.delete(response));
       return;
     }
     if (request.method === 'POST' && url === '/api/live') {
@@ -480,7 +510,7 @@ async function main() {
 
   const port = Number(process.env.TYPST_AGENT_PORT ?? 8766);
   server.listen(port, '127.0.0.1', () => {
-    console.log(`Typst 课堂: http://127.0.0.1:${port}`);
+    console.log(`Typst 课堂: http://127.0.0.1:${server.address().port}`);
   });
 }
 
